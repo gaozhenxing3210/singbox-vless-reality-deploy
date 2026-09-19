@@ -2,26 +2,16 @@
 set -eu
 
 # VLESS + Reality installer for standard VPS and IPv4 NAT instances.
-# Required NAT setup: map PUBLIC_PORT/TCP to LISTEN_ADDR:LISTEN_PORT/TCP first.
+# NAT instances use NAT_PORT_PAIRS, for example 11570:80,11571:81.
 
 CONFIG_DIR=/etc/sing-box
 CONFIG_FILE="$CONFIG_DIR/config.json"
 LINK_FILE="$CONFIG_DIR/vless-reality-link.txt"
 
 if [ "$(id -u)" -ne 0 ]; then
-  echo "Run this script as root." >&2
+  echo "请使用 root 用户运行此脚本。" >&2
   exit 1
 fi
-
-prompt() {
-  label=$1
-  default=$2
-  var_name=$3
-  printf "%s [%s]: " "$label" "$default"
-  read -r value || true
-  [ -n "$value" ] || value=$default
-  eval "$var_name=\$value"
-}
 
 detect_ipv4() {
   if command -v ip >/dev/null 2>&1; then
@@ -31,6 +21,86 @@ detect_ipv4() {
     ifconfig 2>/dev/null |
       awk '/inet / && $2 !~ /^127\./ { print $2; exit }'
   fi
+}
+
+is_valid_ipv4() {
+  printf "%s\n" "$1" | awk -F. '
+    BEGIN { valid = 1 }
+    NF != 4 { valid = 0; next }
+    {
+      for (i = 1; i <= 4; i++) {
+        if ($i !~ /^[0-9]+$/ || $i > 255) valid = 0
+      }
+    }
+    END { exit valid ? 0 : 1 }
+  '
+}
+
+detect_public_ipv4() {
+  for endpoint in \
+    https://api.ipify.org \
+    https://ipv4.icanhazip.com \
+    https://ifconfig.me/ip
+  do
+    candidate=$(curl -4fsS --connect-timeout 4 --max-time 8 "$endpoint" 2>/dev/null || true)
+    if is_valid_ipv4 "$candidate"; then
+      printf "%s\n" "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+is_private_ipv4() {
+  printf "%s\n" "$1" | awk -F. '
+    BEGIN { private = 0 }
+    NF != 4 { exit 1 }
+    {
+      if ($1 == 10 ||
+          ($1 == 172 && $2 >= 16 && $2 <= 31) ||
+          ($1 == 192 && $2 == 168) ||
+          ($1 == 100 && $2 >= 64 && $2 <= 127)) {
+        private = 1
+      }
+    }
+    END { exit private ? 0 : 1 }
+  '
+}
+
+port_available() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn 2>/dev/null | awk -v port="$1" '
+      NR > 1 && $4 ~ (":" port "$") { used = 1 }
+      END { exit used ? 1 : 0 }
+    '
+    return
+  fi
+
+  return 0
+}
+
+choose_nat_port_pair() {
+  old_ifs=$IFS
+  IFS=,
+
+  for pair in $NAT_PORT_PAIRS; do
+    public_port=${pair%%:*}
+    listen_port=${pair#*:}
+
+    case "$public_port:$listen_port" in
+      *[!0-9:]*|:*|*:) continue ;;
+    esac
+
+    if port_available "$listen_port"; then
+      printf "%s\n" "$pair"
+      IFS=$old_ifs
+      return 0
+    fi
+  done
+
+  IFS=$old_ifs
+  return 1
 }
 
 install_sing_box() {
@@ -62,7 +132,7 @@ EOF
     return
   fi
 
-  echo "Unsupported package manager. Alpine apk and Debian/Ubuntu apt are supported." >&2
+  echo "不支持当前的软件包管理器。仅支持 Alpine（apk）和 Debian/Ubuntu（apt）。" >&2
   exit 1
 }
 
@@ -112,35 +182,59 @@ EOF
     return
   fi
 
-  echo "No supported service manager found." >&2
+  echo "未找到受支持的服务管理器。" >&2
   exit 1
 }
 
 PRIVATE_IPV4=$(detect_ipv4)
-prompt "Internal listen IPv4" "${LISTEN_ADDR:-$PRIVATE_IPV4}" LISTEN_ADDR
-prompt "Internal listen TCP port" "${LISTEN_PORT:-443}" LISTEN_PORT
-prompt "Public hostname or IPv4" "${PUBLIC_HOST:-}" PUBLIC_HOST
-prompt "Public TCP port" "${PUBLIC_PORT:-$LISTEN_PORT}" PUBLIC_PORT
-prompt "Reality handshake domain / SNI" "${SNI:-www.microsoft.com}" SNI
+LISTEN_ADDR=${LISTEN_ADDR:-$PRIVATE_IPV4}
+PUBLIC_HOST=${PUBLIC_HOST:-$(detect_public_ipv4 || true)}
+SNI=${SNI:-www.microsoft.com}
+
+if is_private_ipv4 "$LISTEN_ADDR"; then
+  if [ -n "${NAT_PORT_PAIRS:-}" ] && [ -z "${LISTEN_PORT:-}" ] && [ -z "${PUBLIC_PORT:-}" ]; then
+    selected_pair=$(choose_nat_port_pair || true)
+    if [ -z "$selected_pair" ]; then
+      echo "NAT_PORT_PAIRS 中的内网端口均被占用，无法自动选择监听端口。" >&2
+      exit 1
+    fi
+    PUBLIC_PORT=${selected_pair%%:*}
+    LISTEN_PORT=${selected_pair#*:}
+  elif [ -n "${LISTEN_PORT:-}" ] && [ -n "${PUBLIC_PORT:-}" ]; then
+    :
+  else
+    echo "检测到 NAT 内网 IP。请设置 NAT_PORT_PAIRS，或同时设置 LISTEN_PORT 和 PUBLIC_PORT。" >&2
+    exit 1
+  fi
+else
+  LISTEN_PORT=${LISTEN_PORT:-443}
+  PUBLIC_PORT=${PUBLIC_PORT:-$LISTEN_PORT}
+fi
 
 case "$LISTEN_ADDR" in
-  *:*|"") echo "Use a concrete IPv4 address, not :: or 0.0.0.0." >&2; exit 1 ;;
+  *:*|"") echo "请填写具体的 IPv4 地址，不能使用 :: 或 0.0.0.0。" >&2; exit 1 ;;
 esac
 
 case "$LISTEN_PORT:$PUBLIC_PORT" in
-  *[!0-9:]*|:*|*:) echo "Ports must be numeric." >&2; exit 1 ;;
+  *[!0-9:]*|:*|*:) echo "端口必须是纯数字。" >&2; exit 1 ;;
 esac
 
 case "$PUBLIC_HOST" in
-  ""|*[!A-Za-z0-9.-]*) echo "Public hostname/IP contains unsupported characters." >&2; exit 1 ;;
+  "")
+    echo "无法自动获取公网 IPv4。请检查服务器网络，或用 PUBLIC_HOST=公网IP 重新执行脚本。" >&2
+    exit 1
+    ;;
+  *[!A-Za-z0-9.-]*) echo "公网 IP 或域名含有不支持的字符。" >&2; exit 1 ;;
 esac
 
 case "$SNI" in
-  ""|*[!A-Za-z0-9.-]*) echo "SNI contains unsupported characters." >&2; exit 1 ;;
+  ""|*[!A-Za-z0-9.-]*) echo "SNI 为空，或含有不支持的字符。" >&2; exit 1 ;;
 esac
 
 install_sing_box
 SING_BOX=$(command -v sing-box)
+
+echo "自动配置：内网监听 $LISTEN_ADDR:$LISTEN_PORT，公网连接 $PUBLIC_HOST:$PUBLIC_PORT"
 
 UUID=$("$SING_BOX" generate uuid)
 KEYPAIR=$("$SING_BOX" generate reality-keypair)
@@ -149,7 +243,7 @@ PUBLIC_KEY=$(printf "%s\n" "$KEYPAIR" | awk '/PublicKey:|Password \(PublicKey\):
 SHORT_ID=$(openssl rand -hex 8)
 
 if [ -z "$UUID" ] || [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ]; then
-  echo "Failed to generate VLESS or Reality credentials." >&2
+  echo "生成 VLESS 或 Reality 凭据失败。" >&2
   exit 1
 fi
 
@@ -157,7 +251,7 @@ install -d -m 0755 "$CONFIG_DIR"
 if [ -f "$CONFIG_FILE" ]; then
   backup="$CONFIG_FILE.bak.$(date +%Y%m%d%H%M%S)"
   cp -p "$CONFIG_FILE" "$backup"
-  echo "Existing config backed up to $backup"
+  echo "原配置已备份到：$backup"
 fi
 
 cat > "$CONFIG_FILE" <<EOF
@@ -221,10 +315,10 @@ umask 077
 printf "%s\n" "$LINK" > "$LINK_FILE"
 
 echo
-echo "sing-box is running."
-echo "Server listener: $LISTEN_ADDR:$LISTEN_PORT"
-echo "Client endpoint: $PUBLIC_HOST:$PUBLIC_PORT"
-echo "VLESS link:"
+echo "sing-box 已启动。"
+echo "服务端内网监听：$LISTEN_ADDR:$LISTEN_PORT"
+echo "客户端公网连接：$PUBLIC_HOST:$PUBLIC_PORT"
+echo "VLESS 链接："
 cat "$LINK_FILE"
 echo
-echo "Saved link: $LINK_FILE"
+echo "链接已保存到：$LINK_FILE"
